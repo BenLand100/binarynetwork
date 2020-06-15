@@ -26,12 +26,12 @@ class Neuron:
             error_vals[self.inputs] += self.weights*error_vals[self.index]
             return True
         
-    def update(self,final_state,error_vals,scale,noise=0.1):
+    def update(self,final_state,error_vals,scale,noise=None):
         if len(self.inputs) > 0:
             delta = error_vals[self.index]*final_state[self.inputs]*scale
-            self.weights += np.random.normal(delta,np.abs(delta)*noise)
+            self.weights += np.random.normal(delta,np.abs(delta)*noise) if noise is not None else delta
             delta = error_vals[self.index]*scale
-            self.threshold += np.random.normal(delta,np.abs(delta)*noise)
+            self.threshold += np.random.normal(delta,np.abs(delta)*noise) if noise is not None else delta
         
     def add_input(self,index,weight=None):
         if weight is None:
@@ -155,7 +155,7 @@ class System:
             return state[self.outputs]
     
     
-    def learn(self,final_state,truth_vals,scale=0.5):
+    def learn(self,final_state,truth_vals,scale=1.0,noise=None):
         error_vals = np.zeros_like(final_state,dtype=np.float32)
         error_mask = np.zeros_like(final_state,dtype=np.bool)
         error_vals[self.outputs] = truth_vals - final_state[self.outputs]
@@ -169,5 +169,5 @@ class System:
                         stack.append(input)
         #print('errors',error_vals)
         for neuron in self.neurons:
-            neuron.update(final_state,error_vals,scale)
+            neuron.update(final_state,error_vals,scale,noise=noise)
         
