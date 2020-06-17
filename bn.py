@@ -2,6 +2,7 @@ import numpy as np
 from collections import deque
 
 class Neuron:
+    '''A neuron that implements a step activation function and accompanying error calculations.'''
     
     def __init__(self,index=None):
         self.index = index
@@ -16,7 +17,7 @@ class Neuron:
             value = np.dot(self.weights,state_current) + self.threshold
         else:
             value = np.dot(self.weights,state_current[self.inputs]) + self.threshold
-        return 1.0 if value > 0 else -1.0
+        return 1.0 if value > 0 else -1.0 #differentiate this!
     
     def learn(self,final_state, error_vals, error_mask):
         if not np.all(error_mask[self.outputs]):
@@ -28,9 +29,9 @@ class Neuron:
         
     def update(self,final_state,error_vals,scale,noise=None):
         if len(self.inputs) > 0:
-            delta = error_vals[self.index]*final_state[self.inputs]*scale
+            delta = error_vals[self.index]*final_state[self.inputs]*scale #no derivatives here!
             self.weights += np.random.normal(delta,np.abs(delta)*noise) if noise is not None else delta
-            delta = error_vals[self.index]*scale
+            delta = error_vals[self.index]*scale #no derivatives here!
             self.threshold += np.random.normal(delta,np.abs(delta)*noise) if noise is not None else delta
         
     def add_input(self,index,weight=None):
@@ -64,10 +65,110 @@ class Neuron:
         else:
             return 'N[%i] = input'%self.index
     
+class Instance:
+    '''Represents a structure built into a network'''
+    def __init__(self,parent,output_neurons,output_shape):
+        self.parent = parent
+        self.neurons = output_neurons
+        self.outputs = np.asarray([n.index for n in output_neurons],dtype=np.int32).reshape(output_shape)
+        
+    def get_state(self,state):
+        return state[self.outputs].reshape(self.outputs.shape)
+    
+class Structure:
+    '''Represents collections of neurons as an input->output device'''
+    def construct(self,system,inputs):
+        return np.asarray([],dtype=np.int32)
+    def constrain(self,system,data):
+        pass
+
+class Input(Structure):
+    '''Structure to inject values into the network'''
+    def __init__(self,shape):
+        self.shape = shape
+        
+    def construct(self,system,inputs):
+        layer = [system.add_neuron(input=True) for i_inner in range(np.prod(self.shape,dtype=np.int32))]
+        return Instance(self,layer,self.shape)
+    
+class Output(Structure):
+    '''Structure to extract values from network'''
+    def __init__(self,shape):
+        self.shape = shape
+        
+    def construct(self,system,inputs):
+        inputs = inputs.flatten()
+        layer = [system.add_neuron(output=True) for i_inner in range(np.prod(self.shape,dtype=np.int32))]
+        for neuron in layer:
+            for i_input in inputs:
+                neuron.add_input(i_input)
+        return Instance(self,layer,self.shape)
+        
+class Dense(Structure):
+    '''Structure that connects all neurons in the specified shape to all neurons of any shaped input'''
+    def __init__(self,shape):
+        self.shape = shape
+        
+    def construct(self,system,inputs):
+        inputs = inputs.flatten()
+        layer = [system.add_neuron() for i_inner in range(np.prod(self.shape,dtype=np.int32))]
+        for neuron in layer:
+            for i_input in inputs:
+                neuron.add_input(i_input)
+        outputs = np.asarray([n.index for n in layer],dtype=np.int32).reshape(self.shape)
+        return Instance(self,layer,self.shape)
+    
+class Conv(Structure):
+    '''Convolves an input shape with some dense kernel of neurons.
+       Can use multiple kernels to add a dimension to the output if out_shape is specified.
+       Works with a surprising variety of input, kernel, and output shapes.'''
+    
+    def __init__(self,kernel_shape=(3,3),out_shape=()):
+        self.kernel_shape = kernel_shape
+        self.out_shape = out_shape
+        self.out_size = np.prod(self.out_shape,dtype=np.int32)
+        
+    def construct(self,system,inputs):
+        conv_shape = tuple([in_dim-kernel_dim+1 for in_dim,kernel_dim in zip(inputs.shape,self.kernel_shape)])
+        layer = [system.add_neuron() for i_inner in range(np.prod(conv_shape,dtype=np.int32)*self.out_size)]
+        for i,c_index in enumerate(np.ndindex(*conv_shape)):
+            for k_index in np.ndindex(*self.kernel_shape):
+                u_index = tuple(np.asarray(c_index) + np.asarray(k_index)) #this is magical
+                if len(self.out_shape) > 0:
+                    if len(inputs.shape)-len(self.kernel_shape) > 0:
+                        for j in range(i*self.out_size,(i+1)*self.out_size):
+                            for input in inputs[u_index].flatten():
+                                layer[j].add_input(input)
+                    else:
+                        for j in range(i*self.out_size,(i+1)*self.out_size):
+                            layer[j].add_input(inputs[u_index])
+                else:
+                    if len(inputs.shape)-len(self.kernel_shape) > 0:
+                        for input in inputs[u_index].flatten():
+                            layer[i].add_input(input)
+                    else:
+                        layer[i].add_input(inputs[u_index])
+                    
+        system.add_constraint(self,layer)
+        return Instance(self,layer,conv_shape+self.out_shape)
+        
+    def constrain(self,system,conv_neurons):
+        for i in range(self.out_size):
+            norm = len(conv_neurons)/self.out_size
+            weights = np.sum([conv_neurons[j].weights for j in range(i,len(conv_neurons),self.out_size)],axis=0)/norm
+            threshold = np.sum([conv_neurons[j].threshold for j in range(i,len(conv_neurons),self.out_size)],axis=0)/norm
+            for j in range(i,len(conv_neurons),self.out_size):
+                conv_neurons[j].weights[:] = weights
+                conv_neurons[j].threshold = threshold
+    
 class System:
+    '''Manages a neural network. Create neurons in the network with add_neuron. 
+       Structures will call add_neuron when their construct methods are called.
+       Contains logic for forward and back propagation, where neurons calculate their own errors.'''
     
     def __init__(self):
         self.neurons = []
+        self.constraints = []
         self.inputs = []
         self.outputs = []
         self.recompute_cache = {}
@@ -87,6 +188,9 @@ class System:
     def get_neuron(self,index):
         return self.neurons[index]
     
+    def add_constraint(self,constraint,data):
+        self.constraints.append((constraint,data))
+    
     def finalize(self):
         outputs = [[] for neuron in self.neurons]
         for neuron in self.neurons:
@@ -96,6 +200,8 @@ class System:
         for neuron in self.neurons:
             neuron.outputs = np.asarray(outputs[neuron.index],dtype=np.int32)
             neuron.outputs_set = frozenset(outputs[neuron.index])
+        for constraint,data in self.constraints:
+            constraint.constrain(constraint,data)
         
     def _empty_state(self):
         return np.zeros_like(self.neurons,dtype=np.bool),np.zeros_like(self.neurons,dtype=np.float32)
@@ -170,4 +276,6 @@ class System:
         #print('errors',error_vals)
         for neuron in self.neurons:
             neuron.update(final_state,error_vals,scale,noise=noise)
+        for constraint,data in self.constraints:
+            constraint.constrain(constraint,data)
         

@@ -110,5 +110,11 @@ def tagged_data(n):
     txt_block = speech_like(n,2)
     yield from (gen_data(''.join(i),flat=True) for i in txt_block)
     
+def tagged_2d_data(n):
+    txt_block = speech_like(n,2)
+    yield from (gen_data(''.join(i)) for i in txt_block)
+    
 out_size = len(letters)
+out_shape = (len(letters),)
 in_size = len(next(tagged_data(1))[1])
+in_2d_shape = next(tagged_2d_data(1))[1].shape
