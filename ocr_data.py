@@ -67,7 +67,7 @@ for letter in string.ascii_lowercase:
     if letter in approx_freq:
         approx_freq[letter] *=  10
 
-letters = np.asarray([chr(c) for c in range(ord('A'),ord('Z'))])
+letters = np.asarray([chr(c) for c in range(ord('A'),ord('Z')+1)])
 #letters = np.asarray(list(approx_freq.keys()))
 indices = {s:i for i,s in enumerate(letters)}
 
