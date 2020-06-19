@@ -12,27 +12,36 @@ class Neuron:
         self.weights = []
         self.threshold = 0
         
-    def activate(self,state_current,only_inputs=False):
+    def activate(self,state,only_inputs=False):
+        '''Calculates the output of this neuron with the given state.
+           If only_inputs is True, state should be the same shape as the inputs list.
+           Otherwise state is indexed by the inputs list'''
         if only_inputs:
-            value = np.dot(self.weights,state_current) + self.threshold
+            value = np.dot(self.weights,state) + self.threshold
         else:
-            value = np.dot(self.weights,state_current[self.inputs]) + self.threshold
+            value = np.dot(self.weights,state[self.inputs]) + self.threshold
         return 1.0 if value > 0 else -1.0 #differentiate this!
     
-    def learn(self,final_state, error_vals, error_mask):
+    def calculate_delta(self, final_state, error_vals, error_mask, scale=1.0):
+        '''Calculates the amount to adjust each weight (and threshold) by w.r.t the propagated error.
+           Returns None if propagated errors of outputs are unavailable.'''
         if not np.all(error_mask[self.outputs]):
-            return False
+            return None
         if len(self.inputs) > 0:
             inputs = final_state[self.inputs]
-            error_vals[self.inputs] += self.weights*error_vals[self.index]
-            return True
+            error = error_vals[self.index]
+            error_vals[self.inputs] += self.weights*error
+            weights_delta = error*inputs*scale #no derivatives here!
+            threshold_delta = error*scale #no derivatives here!
+            return np.append(weights_delta,threshold_delta)
+        else:
+            return np.asarray([],dtype=np.float32)
         
-    def update(self,final_state,error_vals,scale,noise=None):
+    def apply_delta(self,delta):
+        '''Adjusts the weights (and thershold) by precalculated deltas.'''
         if len(self.inputs) > 0:
-            delta = error_vals[self.index]*final_state[self.inputs]*scale #no derivatives here!
-            self.weights += np.random.normal(delta,np.abs(delta)*noise) if noise is not None else delta
-            delta = error_vals[self.index]*scale #no derivatives here!
-            self.threshold += np.random.normal(delta,np.abs(delta)*noise) if noise is not None else delta
+            self.weights += delta[:-1]
+            self.threshold += delta[-1]
         
     def add_input(self,index,weight=None):
         if weight is None:
@@ -54,6 +63,7 @@ class Neuron:
         del self.weights[i]
     
     def finalize(self):
+        '''Prepares the neuron for calculations.'''
         self.weights = np.asarray(self.weights,dtype=np.float32)
         self.inputs = np.asarray(self.inputs,dtype=np.int32)
     
@@ -192,6 +202,7 @@ class System:
         self.constraints.append((constraint,data))
     
     def finalize(self):
+        '''Prepares the system of neurons for calculations.'''
         outputs = [[] for neuron in self.neurons]
         for neuron in self.neurons:
             neuron.finalize()
@@ -210,7 +221,7 @@ class System:
         changed_indexes = np.nonzero(state_changed)[0]
         state_next_changed = np.zeros_like(state_changed)
         state_next = state.copy()
-        if len(changed_indexes)/len(self.neurons) > 0.25: 
+        if len(changed_indexes)/len(self.neurons) > 0.50: 
             #brute force stepping algorithm
             for index,neuron in enumerate(self.neurons):
                 if np.any(np.in1d(neuron.inputs,changed_indexes,assume_unique=True)):
@@ -238,11 +249,14 @@ class System:
                     state_next[index] = value
             return state_next_changed,state_next
     
-    def guess(self,inputs,return_state=False):
+    def guess(self,inputs,init_state=None,return_state=False):
+        '''Can reuse a previous state with init_state but BE SURE the weights DID NOT change!'''
         #for n in self.neurons:
         #    print(n)
             
         changed,state = self._empty_state()
+        if init_state is not None:
+            state[:] = init_state
         changed[self.inputs] = True
         state[self.inputs] = inputs
         
@@ -260,22 +274,48 @@ class System:
         else:
             return state[self.outputs]
     
+    def learn(self,final_state,truth_vals,scale=1.0,batch=False):
+        deltas = self.calculate_deltas(final_state,truth_vals,scale=scale)
+        if batch:
+            return deltas
+        else:
+            self.apply_deltas(deltas,batch=False)
     
-    def learn(self,final_state,truth_vals,scale=1.0,noise=None):
+    def calculate_deltas(self,final_state,truth_vals,scale=1.0):
         error_vals = np.zeros_like(final_state,dtype=np.float32)
         error_mask = np.zeros_like(final_state,dtype=np.bool)
+        not_pending_mask = np.ones_like(final_state,dtype=np.bool)
         error_vals[self.outputs] = truth_vals - final_state[self.outputs]
+        deltas = np.empty_like(self.neurons,dtype=object)
         stack = deque(self.outputs)
         while len(stack) > 0:
             neuron = self.neurons[stack.popleft()]
-            if neuron.learn(final_state,error_vals,error_mask):
+            not_pending_mask[neuron.index] = True
+            if (delta := neuron.calculate_delta(final_state,error_vals,error_mask,scale=scale)) is not None:
+                deltas[neuron.index] = delta
                 error_mask[neuron.index] = True
-                for input in neuron.inputs:
-                    if input not in stack:
-                        stack.append(input)
+                
+                queue_up = not_pending_mask[neuron.inputs]
+                queue_up = neuron.inputs[queue_up]
+                not_pending_mask[queue_up] = False
+                stack.extend(queue_up)
+                
         #print('errors',error_vals)
-        for neuron in self.neurons:
-            neuron.update(final_state,error_vals,scale,noise=noise)
+        return deltas
+    
+    def apply_deltas(self,deltas,batch=False):
+        '''In principle you could average many deltas (batch = True) from many trials to find a better gradient.
+           In practice, don't. Online training is better.'''
+        if batch:
+            batch_deltas = deltas
+            deltas = batch_deltas[0]
+            for batch in batch_deltas[1:]:
+                for j in range(len(deltas)):
+                    deltas[j] += batch[j]
+            for j in range(len(deltas)):
+                deltas[j] /= len(batch_deltas)
+            
+        for neuron,delta in zip(self.neurons,deltas):
+            neuron.apply_delta(delta)
         for constraint,data in self.constraints:
             constraint.constrain(constraint,data)
-        
