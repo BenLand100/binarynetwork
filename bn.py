@@ -1,4 +1,5 @@
 import numpy as np
+import h5py
 from collections import deque
 
 class Neuron:
@@ -10,9 +11,9 @@ class Neuron:
         self.outputs = None
         self.outputs_set = None
         self.weights = []
-        self.threshold = 0
+        self.threshold = np.random.normal(0,0.34)
         
-    def activate(self,state,only_inputs=False):
+    def activate(self,state,only_inputs=False,raw=False):
         '''Calculates the output of this neuron with the given state.
            If only_inputs is True, state should be the same shape as the inputs list.
            Otherwise state is indexed by the inputs list'''
@@ -20,7 +21,7 @@ class Neuron:
             value = np.dot(self.weights,state) + self.threshold
         else:
             value = np.dot(self.weights,state[self.inputs]) + self.threshold
-        return 1.0 if value > 0 else -1.0 #differentiate this!
+        return value if raw else (1.0 if value > 0 else -1.0) #differentiate this!
     
     def calculate_delta(self, final_state, error_vals, error_mask, scale=1.0):
         '''Calculates the amount to adjust each weight (and threshold) by w.r.t the propagated error.
@@ -31,11 +32,12 @@ class Neuron:
             inputs = final_state[self.inputs]
             error = error_vals[self.index]
             error_vals[self.inputs] += self.weights*error
-            weights_delta = error*inputs*scale #no derivatives here!
-            threshold_delta = error*scale #no derivatives here!
+            error = np.sign(error)
+            weights_delta = error*inputs*scale
+            threshold_delta = error*scale
             return np.append(weights_delta,threshold_delta)
         else:
-            return np.asarray([],dtype=np.float32)
+            return np.asarray([],dtype=np.float64)
         
     def apply_delta(self,delta):
         '''Adjusts the weights (and thershold) by precalculated deltas.'''
@@ -64,7 +66,7 @@ class Neuron:
     
     def finalize(self):
         '''Prepares the neuron for calculations.'''
-        self.weights = np.asarray(self.weights,dtype=np.float32)
+        self.weights = np.asarray(self.weights,dtype=np.float64)
         self.inputs = np.asarray(self.inputs,dtype=np.int32)
     
     def __str__(self):
@@ -133,17 +135,21 @@ class Conv(Structure):
        Can use multiple kernels to add a dimension to the output if out_shape is specified.
        Works with a surprising variety of input, kernel, and output shapes.'''
     
-    def __init__(self,kernel_shape=(3,3),out_shape=()):
+    def __init__(self,kernel_shape=(3,3),out_shape=(),kernel_stride=None):
+        if kernel_stride is None:
+            self.kernel_stride = {elem for elem in np.ones_like(kernel_shape)}
+        else:
+            self.kernel_stride = kernel_stride
         self.kernel_shape = kernel_shape
         self.out_shape = out_shape
         self.out_size = np.prod(self.out_shape,dtype=np.int32)
         
     def construct(self,system,inputs):
-        conv_shape = tuple([in_dim-kernel_dim+1 for in_dim,kernel_dim in zip(inputs.shape,self.kernel_shape)])
+        conv_shape = tuple([(in_dim-kernel_dim)//stride+1 for in_dim,kernel_dim,stride in zip(inputs.shape,self.kernel_shape,self.kernel_stride)])
         layer = [system.add_neuron() for i_inner in range(np.prod(conv_shape,dtype=np.int32)*self.out_size)]
         for i,c_index in enumerate(np.ndindex(*conv_shape)):
             for k_index in np.ndindex(*self.kernel_shape):
-                u_index = tuple(np.asarray(c_index) + np.asarray(k_index)) #this is magical
+                u_index = tuple(np.asarray(c_index)*np.asarray(self.kernel_stride) + np.asarray(k_index)) #this is magical
                 if len(self.out_shape) > 0:
                     if len(inputs.shape)-len(self.kernel_shape) > 0:
                         for j in range(i*self.out_size,(i+1)*self.out_size):
@@ -183,6 +189,32 @@ class System:
         self.outputs = []
         self.recompute_cache = {}
         
+    def save_weights(self,fname,checkpoint=None):
+        with h5py.File(fname,'a') as hf:
+            if checkpoint is None:
+                checkpoint = 'default'
+            if checkpoint not in hf:
+                gr = hf.create_group(checkpoint) 
+            else:
+                gr = hf[checkpoint]
+            for n in self.neurons:
+                name = 'neuron_%i'%n.index
+                if name in gr:
+                    gr[name][:] = np.append(n.weights,n.threshold)
+                else:
+                    gr[name] = np.append(n.weights,n.threshold)
+                    
+    def load_weights(self,fname,checkpoint=None):
+        with h5py.File(fname,'r') as hf:
+            if checkpoint is None:
+                checkpoint = 'default'
+            gr = hf[checkpoint]   
+            for n in self.neurons:
+                name = 'neuron_%i'%n.index
+                weights = gr[name]
+                n.weights[:] = weights[:-1]
+                n.threshold = weights[-1]
+        
     def add_neuron(self,neuron=None,input=False,output=False):
         if neuron is None:
             neuron = Neuron(index=len(self.neurons))
@@ -215,13 +247,13 @@ class System:
             constraint.constrain(constraint,data)
         
     def _empty_state(self):
-        return np.zeros_like(self.neurons,dtype=np.bool),np.zeros_like(self.neurons,dtype=np.float32)
+        return np.zeros_like(self.neurons,dtype=np.bool),np.zeros_like(self.neurons,dtype=np.float64)
     
     def _step(self,state_changed,state):
         changed_indexes = np.nonzero(state_changed)[0]
         state_next_changed = np.zeros_like(state_changed)
         state_next = state.copy()
-        if len(changed_indexes)/len(self.neurons) > 0.50: 
+        if len(changed_indexes)/len(self.neurons) > 0.90: 
             #brute force stepping algorithm
             for index,neuron in enumerate(self.neurons):
                 if np.any(np.in1d(neuron.inputs,changed_indexes,assume_unique=True)):
@@ -282,7 +314,7 @@ class System:
             self.apply_deltas(deltas,batch=False)
     
     def calculate_deltas(self,final_state,truth_vals,scale=1.0):
-        error_vals = np.zeros_like(final_state,dtype=np.float32)
+        error_vals = np.zeros_like(final_state,dtype=np.float64)
         error_mask = np.zeros_like(final_state,dtype=np.bool)
         not_pending_mask = np.ones_like(final_state,dtype=np.bool)
         error_vals[self.outputs] = truth_vals - final_state[self.outputs]
